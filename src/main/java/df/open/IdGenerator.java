@@ -28,7 +28,6 @@ import static com.sun.org.apache.xalan.internal.lib.ExsltStrings.split;
  */
 public class IdGenerator {
 
-
     // 时间基线  2016/1/1
     private final long timeBaseLine = 1454315864414L;
 
@@ -37,7 +36,6 @@ public class IdGenerator {
 
     //服务实例编号
     private volatile long instanceId = -1;
-
 
     private volatile boolean inited = false;
 

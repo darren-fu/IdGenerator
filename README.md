@@ -1,6 +1,3 @@
 # IdGenerator
 
-> Create unique ID for distributed system,  from Snowflake
-
-* generate >3000000 IDS per second
-* easy to use, distinguish host automatically
+> 基于雪花算法，本地化ID生成
