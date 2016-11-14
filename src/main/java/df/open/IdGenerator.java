@@ -1,94 +1,250 @@
 package df.open;
 
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.exceptions.JedisException;
+
+import java.net.Inet4Address;
 import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
-import java.net.UnknownHostException;
 import java.util.Random;
+import java.util.concurrent.*;
+import java.util.function.Function;
+import java.util.logging.Logger;
+
+import static com.sun.org.apache.xalan.internal.lib.ExsltStrings.split;
 
 /**
- * 说明:
+ * 说明: 生成唯一性ID,类型Long,64位
+ * 参考雪花算法
  * <p/>
  * Copyright: Copyright (c)
  * <p/>
- * Company: 江苏千米网络科技有限公司
+ * Company:
  * <p/>
  *
- * @author 付亮(OF2101)
+ * @author darren-fu
  * @version 1.0.0
- * @date 2016/10/9
+ * @contact 13914793391
+ * @date 2016/11/10
  */
 public class IdGenerator {
-    private final long workerId;
-    private final long idepoch;
 
-    private static final long workerIdBits = 10L;
-    private static final long maxWorkerId = -1L ^ (-1L << workerIdBits);
 
-    private static final long sequenceBits = 12L;
-    private static final long workerIdShift = sequenceBits;
-    private static final long timestampLeftShift = sequenceBits + workerIdBits;//+ datacenterIdBits;
-    private static final long sequenceMask = -1L ^ (-1L << sequenceBits);
+    // 时间基线  2016/1/1
+    private final long timeBaseLine = 1454315864414L;
+
+    // 服务编号
+    private volatile long serverId = -1;
+
+    //服务实例编号
+    private volatile long instanceId = -1;
+
+
+    private volatile boolean inited = false;
+
+    // 序列号
+    private long sequence;
+
+    private static final String ID_CREATOR_KEY = "ID_CREATOR";
+    private static final String KEY_SEP = ":";
+
+    private static final long timeBits = 41;
+    private static final long serverIdBits = 7;
+    private static final long instanceIdBits = 10;
+    private static final long sequenceBits = 5;
+
+    private static final long maxServerId = -1L ^ (-1L << serverIdBits);
+    private static final long maxInstanceId = -1L ^ (-1L << instanceIdBits);
+    private static final long maxSequence = -1L ^ (-1L << sequenceBits);
+
+
+    private static final long timeBitsShift = serverIdBits + instanceIdBits + sequenceBits;
+    private static final long serverIdBitsShift = instanceIdBits + sequenceBits;
+    private static final long instanceIdBitsShift = sequenceBits;
+
 
     private long lastTimestamp = -1L;
-    private long sequence;
     private static final Random r = new Random();
 
-    public IdGenerator() {
-        this(1344322705519L);
+    private static IdGenerator idGenerator = new IdGenerator();
+
+    private IdGenerator() {
     }
 
-    public IdGenerator(long idepoch) {
-        this(0, 0, idepoch);
+
+    public static IdGenerator getInstance() {
+        return idGenerator;
     }
 
-    public IdGenerator(long workerId, long sequence) {
-        this(workerId, sequence, 1344322705519L);
-    }
-
-    //
-    public IdGenerator(long workerId, long sequence, long idepoch) {
-        this.workerId = workerId == 0 ? genWorkerId() : workerId;
-        this.sequence = sequence;
-        this.idepoch = idepoch;
-        if (workerId < 0 || workerId > maxWorkerId) {
-            throw new IllegalArgumentException("workerId is illegal: " + workerId);
+    /**
+     * 应用启动完成后调用init
+     *
+     * @param serverId
+     */
+    public synchronized void init(long serverId) {
+        this.serverId = serverId;
+        if (!inited) {
+            inited = true;
+            Jedis jedis = new Jedis("localhost", 6379);
+            ScheduledExecutorService scheduledService = Executors.newScheduledThreadPool(1);
+            RegisterIdCreatorInstanceTask registerIdCreatorInstanceTask = new RegisterIdCreatorInstanceTask(jedis);
+            scheduledService.scheduleWithFixedDelay(registerIdCreatorInstanceTask, 0, RegisterIdCreatorInstanceTask.INTERVAL_SECONDS, TimeUnit.SECONDS);
+        } else {
+            System.out.println("已经初始化！");
         }
-        if (idepoch >= System.currentTimeMillis()) {
-            throw new IllegalArgumentException("idepoch is illegal: " + idepoch);
+    }
+
+
+    /**
+     * 注册id生成器实例
+     */
+    private class RegisterIdCreatorInstanceTask implements Runnable {
+        private Logger logger = Logger.getLogger(RegisterIdCreatorInstanceTask.class.getCanonicalName());
+
+        public static final int INTERVAL_SECONDS = 30;
+
+        private Jedis jedis;
+
+        private RegisterIdCreatorInstanceTask(Jedis jedis) {
+            this.jedis = jedis;
+        }
+
+        public void run() {
+
+            try {
+
+                long srvId = idGenerator.getServerId();
+                long currentInstanceId = idGenerator.getInstanceId();
+
+                String prefixKey = ID_CREATOR_KEY + KEY_SEP + srvId + KEY_SEP;
+
+                if (currentInstanceId < 0) {
+                    //注册
+                    registerInstanceIdWithIpv4();
+                } else {
+                    //续约
+                    String result = jedis.set(prefixKey + currentInstanceId, srvId + KEY_SEP + currentInstanceId, "XX", "EX", INTERVAL_SECONDS * 3);
+                    if (!"OK".equals(result)) {
+                        logger.warning("服务[" + srvId + "]ID生成器：" + currentInstanceId + "续约失败，等待重新注册");
+                        registerInstanceIdWithIpv4();
+                    } else {
+                        logger.info("服务[" + srvId + "]ID生成器：" + currentInstanceId + "续约成功");
+                    }
+
+                }
+
+            } catch (JedisException e) {
+                logger.severe("Redis 出现异常！");
+                e.printStackTrace();
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                if (idGenerator.getInstanceId() < 0) {
+                    idGenerator.setInited(false);
+                }
+                if (jedis != null) {
+                    jedis.close();
+                }
+            }
+        }
+
+        private int registerInstanceIdWithIpv4() {
+            long ip4Value = getIp4LongValue();
+            // Redis key 格式:key->val , ID_CREATOR:serverId:instanceId -> serverId:instanceId
+            String prefixKey = ID_CREATOR_KEY + KEY_SEP + serverId + KEY_SEP;
+
+            // 需要使用java8
+            int regInstanceId = registerInstanceId((int) (ip4Value % (maxInstanceId + 1)), (int) maxInstanceId, (v) -> {
+                String res = jedis.set(prefixKey + v, serverId + KEY_SEP + v, "NX", "EX", INTERVAL_SECONDS * 3);
+                return "OK".equals(res) ? v : -1;
+            });
+
+            idGenerator.setInstanceId(regInstanceId);
+            idGenerator.setInited(true);
+
+            logger.info("服务[" + serverId + "]注册了一个ID生成器：" + regInstanceId);
+            return regInstanceId;
+        }
+
+
+        /**
+         * 注册instance,成功就返回
+         *
+         * @param basePoint
+         * @param max
+         * @param action
+         * @return
+         */
+        public int registerInstanceId(int basePoint, int max, Function<Integer, Integer> action) {
+            int result;
+            for (int i = basePoint; i <= max; i++) {
+                result = action.apply(i);
+                if (result > -1) {
+                    return result;
+                }
+            }
+
+            for (int i = 0; i < basePoint; i++) {
+                result = action.apply(i);
+                if (result > -1) {
+                    return result;
+                }
+            }
+            return 0;
+        }
+
+        /**
+         * IPV4地址转Long
+         *
+         * @return
+         */
+        private long getIp4LongValue() {
+            try {
+                InetAddress inetAddress = Inet4Address.getLocalHost();
+                byte[] ip = inetAddress.getAddress();
+
+                return Math.abs(((0L | ip[0]) << 24)
+                        | ((0L | ip[1]) << 16)
+                        | ((0L | ip[2]) << 8)
+                        | (0L | ip[3]));
+
+            } catch (Exception ex) {
+                ex.printStackTrace();
+                return 0;
+            }
         }
     }
 
 
-    public long getWorkerId() {
-        return workerId;
-    }
-
-    public long getTime() {
-        return System.currentTimeMillis();
-    }
-
+    /**
+     * 获取ID
+     *
+     * @return
+     */
     public long getId() {
         long id = nextId();
         return id;
     }
 
     private synchronized long nextId() {
-        long timestamp = timeGen();
-        if (timestamp < lastTimestamp) {
-            throw new IllegalStateException("Clock moved backwards.");
+        if (serverId < 0 || instanceId < 0) {
+            throw new IllegalArgumentException("目前不能生成唯一性ID,serverId:[" + serverId + "],instanceId:[" + instanceId + "]!");
         }
+
+        long timestamp = currentTime();
+        if (timestamp < lastTimestamp) {
+            throw new IllegalStateException("Err clock");
+        }
+        sequence = (sequence + 1) & maxSequence;
         if (lastTimestamp == timestamp) {
-            sequence = (sequence + 1) & sequenceMask;
             if (sequence == 0) {
                 timestamp = tilNextMillis(lastTimestamp);
             }
-        } else {
-            sequence = 0;
         }
         lastTimestamp = timestamp;
-        long id = ((timestamp - idepoch) << timestampLeftShift)//
-                | (workerId << workerIdShift)//
+
+        long id = ((timestamp - timeBaseLine) << timeBitsShift)
+                | (serverId << serverIdBitsShift)
+                | (instanceId << instanceIdBitsShift)
                 | sequence;
         return id;
     }
@@ -100,50 +256,57 @@ public class IdGenerator {
      * @return the timestamp of id
      */
     public long getIdTimestamp(long id) {
-        return idepoch + (id >> timestampLeftShift);
+        return timeBaseLine + (id >> timeBitsShift);
     }
 
     private long tilNextMillis(long lastTimestamp) {
-        long timestamp = timeGen();
+        long timestamp = currentTime();
         while (timestamp <= lastTimestamp) {
-            timestamp = timeGen();
+            timestamp = currentTime();
         }
         return timestamp;
     }
 
-    private long timeGen() {
+    private long currentTime() {
         return System.currentTimeMillis();
     }
 
     @Override
     public String toString() {
-        final StringBuilder sb = new StringBuilder("IdWorker{");
-        sb.append("workerId=").append(workerId);
-        sb.append(", idepoch=").append(idepoch);
+        final StringBuilder sb = new StringBuilder("IdCreator{");
+        sb.append("serverId=").append(serverId);
+        sb.append(",instanceId=").append(instanceId);
+        sb.append(", timeBaseLine=").append(timeBaseLine);
         sb.append(", lastTimestamp=").append(lastTimestamp);
         sb.append(", sequence=").append(sequence);
         sb.append('}');
         return sb.toString();
     }
 
-    protected long genWorkerId() {
 
-        try {
-            InetAddress ip = InetAddress.getLocalHost();
-            NetworkInterface network = NetworkInterface.getByInetAddress(ip);
-            long id;
-            if (network == null) {
-                id = 1;
-            } else {
-                byte[] mac = network.getHardwareAddress();
-                id = ((0x000000FF & (long) mac[mac.length - 1]) | (0x0000FF00 & (((long) mac[mac.length - 2]) << 8))) >> 6;
-            }
-            return id;
-        } catch (SocketException e) {
-            e.printStackTrace();
-        } catch (UnknownHostException e) {
-            e.printStackTrace();
-        }
-        return 0;
+    public long getServerId() {
+        return serverId;
     }
+
+    private void setServerId(long serverId) {
+        this.serverId = serverId;
+    }
+
+    public long getInstanceId() {
+        return instanceId;
+    }
+
+
+    private void setInstanceId(long instanceId) {
+        this.instanceId = instanceId;
+    }
+
+    public boolean isInited() {
+        return inited;
+    }
+
+    private void setInited(boolean inited) {
+        this.inited = inited;
+    }
+
 }
