@@ -2,6 +2,10 @@ package df.open;
 
 import org.junit.Test;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
 /**
  * 说明:
  * <p/>
@@ -16,6 +20,19 @@ import org.junit.Test;
  * @date 2016/11/10
  */
 public class TestIdCreator {
+
+
+    @Test
+    public void testIp() throws UnknownHostException {
+        InetAddress inetAddress = Inet4Address.getLocalHost();
+        byte[] ip = inetAddress.getAddress();
+
+        long ipv = Math.abs((ip[0] << 24)
+                | (ip[1] << 16)
+                | (ip[2] << 8)
+                | ip[3]);
+        System.out.println(ipv);
+    }
 
 
     @Test

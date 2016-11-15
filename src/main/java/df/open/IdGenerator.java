@@ -6,11 +6,11 @@ import redis.clients.jedis.exceptions.JedisException;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.util.Random;
-import java.util.concurrent.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.logging.Logger;
-
-import static com.sun.org.apache.xalan.internal.lib.ExsltStrings.split;
 
 /**
  * 说明: 生成唯一性ID,类型Long,64位
@@ -45,14 +45,14 @@ public class IdGenerator {
     private static final String ID_CREATOR_KEY = "ID_CREATOR";
     private static final String KEY_SEP = ":";
 
-    private static final long timeBits = 41;
+    //    private static final long timeBits = 41;
     private static final long serverIdBits = 7;
     private static final long instanceIdBits = 10;
     private static final long sequenceBits = 5;
 
-    private static final long maxServerId = -1L ^ (-1L << serverIdBits);
-    private static final long maxInstanceId = -1L ^ (-1L << instanceIdBits);
-    private static final long maxSequence = -1L ^ (-1L << sequenceBits);
+    private static final long maxServerId = ~(-1L << serverIdBits);
+    private static final long maxInstanceId = ~(-1L << instanceIdBits);
+    private static final long maxSequence = ~(-1L << sequenceBits);
 
 
     private static final long timeBitsShift = serverIdBits + instanceIdBits + sequenceBits;
@@ -79,12 +79,17 @@ public class IdGenerator {
      * @param serverId
      */
     public synchronized void init(long serverId) {
+        if (serverId > maxServerId || serverId < 0) {
+            throw new IllegalArgumentException("serveriId最小值为： 0,最大值为： " + maxServerId);
+        }
+
         this.serverId = serverId;
         if (!inited) {
             inited = true;
             Jedis jedis = new Jedis("localhost", 6379);
             ScheduledExecutorService scheduledService = Executors.newScheduledThreadPool(1);
             RegisterIdCreatorInstanceTask registerIdCreatorInstanceTask = new RegisterIdCreatorInstanceTask(jedis);
+            // 定义定时任务，定期调用redis注册，续约instanceId
             scheduledService.scheduleWithFixedDelay(registerIdCreatorInstanceTask, 0, RegisterIdCreatorInstanceTask.INTERVAL_SECONDS, TimeUnit.SECONDS);
         } else {
             System.out.println("已经初始化！");
@@ -200,10 +205,10 @@ public class IdGenerator {
                 InetAddress inetAddress = Inet4Address.getLocalHost();
                 byte[] ip = inetAddress.getAddress();
 
-                return Math.abs(((0L | ip[0]) << 24)
-                        | ((0L | ip[1]) << 16)
-                        | ((0L | ip[2]) << 8)
-                        | (0L | ip[3]));
+                return Math.abs((ip[0] << 24)
+                        | (ip[1] << 16)
+                        | (ip[2] << 8)
+                        | ip[3]);
 
             } catch (Exception ex) {
                 ex.printStackTrace();
